@@ -118,3 +118,27 @@ class ErrorResponse(BaseModel):
     code: str
     message: str
     details: dict[str, Any] = {}
+
+
+class EvaluateBatchRequest(BaseModel):
+    documents: list[Any] = Field(
+        ..., min_length=1, max_length=100, description="待决策文档数组，单次最多 100 项"
+    )
+    version: int | None = Field(
+        None, ge=1, description="指定规则版本；默认当前最新版。整批固定使用同一版本"
+    )
+
+
+class EvaluateBatchItem(BaseModel):
+    index: int = Field(..., description="输入 documents 中的下标")
+    ok: bool
+    result: dict[str, Any] | None = Field(None, description="ok=true 时的决策结果")
+    error: ErrorResponse | None = Field(None, description="ok=false 时的错误信息")
+
+
+class EvaluateBatchResponse(BaseModel):
+    ruleset_id: str
+    version: int
+    success_count: int
+    error_count: int
+    results: list[EvaluateBatchItem]

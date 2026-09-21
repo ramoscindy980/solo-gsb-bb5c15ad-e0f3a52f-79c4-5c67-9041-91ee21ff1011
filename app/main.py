@@ -21,6 +21,8 @@ from .engine import (
 )
 from .schemas import (
     ErrorResponse,
+    EvaluateBatchRequest,
+    EvaluateBatchResponse,
     EvaluateRequest,
     EvaluationOut,
     RecomputeRequest,
@@ -311,6 +313,95 @@ def evaluate_document(
             **result,
         }
     return record
+
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/evaluate-batch",
+    response_model=EvaluateBatchResponse,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}},
+)
+def evaluate_batch(
+    ruleset_id: str,
+    req: EvaluateBatchRequest,
+    persist: bool = Query(False, description="是否持久化成功项的结果（默认否）"),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """批量决策：整批固定同一规则版本，逐项独立求值。
+
+    单项求值失败只在该项结果中记录错误，不中止整批；
+    响应按输入下标 index 对齐返回，并汇总成功/失败计数。
+    """
+    row = crud.get_ruleset(conn, ruleset_id)
+    if row is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+
+    target_version = req.version or row["current_version"]
+    try:
+        _snapshot, compiled = _load_compiled(conn, ruleset_id, target_version)
+    except LookupError:
+        return _error(
+            "VERSION_NOT_FOUND", f"版本 {target_version} 不存在", 404
+        )
+
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    error_count = 0
+    for index, document in enumerate(req.documents):
+        try:
+            outcome = evaluate(compiled, document)
+        except EvaluationFailed as exc:
+            error_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "details": exc.details,
+                    },
+                }
+            )
+            continue
+        except Exception as exc:  # 防御性兜底：单项异常不中止整批
+            error_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "ok": False,
+                    "error": {
+                        "code": "EVALUATION_ERROR",
+                        "message": str(exc),
+                        "details": {},
+                    },
+                }
+            )
+            continue
+
+        if persist:
+            record = crud.save_evaluation(
+                conn, ruleset_id, target_version, document, outcome
+            )
+        else:
+            record = {
+                "id": "",
+                "ruleset_id": ruleset_id,
+                "version": target_version,
+                "document": document,
+                "created_at": crud.now(),
+                **outcome,
+            }
+        success_count += 1
+        results.append({"index": index, "ok": True, "result": record})
+
+    return {
+        "ruleset_id": ruleset_id,
+        "version": target_version,
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": results,
+    }
 
 
 @app.post(

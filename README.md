@@ -37,6 +37,18 @@ docker compose up --build
 # 服务监听 http://localhost:8000，自动建库并写入演示规则集 demo-promotions
 ```
 
+### Docker（单容器）
+
+```bash
+docker build -t rule-decision-service .
+docker run -d --name rule-decision-service \
+  -p 8000:8000 \
+  -v rule-data:/data \
+  rule-decision-service
+# 默认环境变量：SEED_DEMO=1（写入演示规则集）、DATABASE_URL=sqlite:////data/rules.db
+# 覆盖示例：docker run -e SEED_DEMO=0 -e DATABASE_URL=sqlite:////data/rules.db ...
+```
+
 健康检查与交互文档：
 
 - 健康检查：<http://localhost:8000/health>
@@ -148,6 +160,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
+| `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策：同一版本对多份文档逐项求值（单次 ≤ 100 项），单项失败不中止整批 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
 | `POST` | `/api/rulesets/{id}/recompute` | 用旧文档对最新版重算（保留旧结果） |
@@ -167,6 +180,68 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
 
 # 3) 查询历史结果
 curl -s localhost:8000/api/rulesets/demo-promotions/evaluations | python3 -m json.tool
+```
+
+### 批量决策
+
+`POST /api/rulesets/{id}/evaluate-batch` 一次提交多份文档（请求体 `documents` 数组，
+**单次最多 100 项**），整批固定使用同一规则版本（请求体可选 `version`，默认当前最新版）。
+每项独立求值：**单项失败只在该项记录错误，不中止整批**；响应按输入下标 `index` 对齐返回，
+并汇总 `success_count` / `error_count`。批量结果默认不持久化，加 `?persist=true` 可保存成功项。
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "documents": [
+      {"amount": 1500, "customer": {"vip": true},  "region": "north"},
+      {"amount": 80,   "customer": {"vip": false}, "region": "south"},
+      {"amount": 3000, "customer": {"vip": false}, "region": "north"}
+    ]
+  }' | python3 -m json.tool
+```
+
+响应示例（节选）：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "version": 1,
+  "success_count": 3,
+  "error_count": 0,
+  "results": [
+    {
+      "index": 0,
+      "ok": true,
+      "result": {
+        "version": 1,
+        "document": {"amount": 1500, "customer": {"vip": true}, "region": "north"},
+        "hit_rule_codes": ["is_vip", "vip_discount", "free_shipping"],
+        "decision": {"vip": true, "discount": 0.15, "reason": "vip_discount", "free_shipping": true}
+      }
+    },
+    {"index": 1, "ok": true, "result": {"fired_rule_codes": [], "decision": {}}},
+    {
+      "index": 2,
+      "ok": true,
+      "result": {
+        "hit_rule_codes": ["large_order", "free_shipping", "manual_review"],
+        "decision": {"discount": 0.1, "reason": "large_order", "free_shipping": true, "manual_review": true}
+      }
+    }
+  ]
+}
+```
+
+某项求值失败时（例如定点迭代不收敛），该项返回 `ok: false` 与错误信息，其余项不受影响：
+
+```json
+{
+  "index": 1,
+  "ok": false,
+  "result": null,
+  "error": {"code": "NOT_CONVERGED", "message": "规则评估在 100 轮内未达到稳定状态", "details": {}}
+}
 ```
 
 ### 循环依赖被拒绝

@@ -75,6 +75,37 @@ class EvaluateRequest(BaseModel):
     document: Any = Field(default_factory=dict)
 
 
+class EvaluateBatchRequest(BaseModel):
+    documents: list[Any] = Field(
+        ...,
+        max_length=100,
+        description="待评估文档数组，单次最多 100 项",
+    )
+    version: int | None = Field(
+        None, ge=1, description="整批固定使用的规则版本；缺省为最新版"
+    )
+
+
+class BatchEvaluationItem(BaseModel):
+    index: int = Field(..., description="结果对应输入 documents 中的下标")
+    status: Literal["success", "error"]
+    result: EvaluationOut | None = Field(
+        None, description="求值成功时的完整决策结果"
+    )
+    error: ErrorResponse | None = Field(
+        None, description="该项求值失败的错误信息，不影响其他项"
+    )
+
+
+class BatchEvaluationOut(BaseModel):
+    ruleset_id: str
+    version: int = Field(..., description="整批实际使用的规则版本")
+    total: int
+    success_count: int
+    error_count: int
+    results: list[BatchEvaluationItem]
+
+
 class ConflictExplanation(BaseModel):
     group: str | None = None
     policy: str

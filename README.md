@@ -37,6 +37,39 @@ docker compose up --build
 # 服务监听 http://localhost:8000，自动建库并写入演示规则集 demo-promotions
 ```
 
+### Docker 直接运行（不使用 Compose）
+
+```bash
+# 构建镜像
+docker build -t rule-decision-service:latest .
+
+# 启动容器；用命名卷持久化 SQLite 数据
+docker run -d \
+  --name rule-decision-service \
+  -p 8000:8000 \
+  -e SEED_DEMO=1 \
+  -e DATABASE_URL='sqlite:////data/rules.db' \
+  -v rule-data:/data \
+  rule-decision-service:latest
+
+# 查看日志 / 停止 / 重新启动
+docker logs -f rule-decision-service
+docker stop rule-decision-service
+docker start rule-decision-service
+```
+
+镜像说明：
+
+- 容器内监听 `8000`，用 `-p 8000:8000` 映射到宿主机；
+- 数据库默认写容器内 `/data/rules.db`（声明为 VOLUME），生产环境务必挂载
+  命名卷或宿主机目录，否则容器删除后数据丢失；
+- 环境变量：
+  - `SEED_DEMO=1`：首次启动写入演示规则集 `demo-promotions`（默认已开启）；
+  - `DATABASE_URL`：SQLite 路径，形如 `sqlite:////data/rules.db`；
+- 镜像内置 `/health` 健康检查（`HEALTHCHECK`），可用
+  `docker ps` 或 `docker inspect` 观察健康状态。
+
+
 健康检查与交互文档：
 
 - 健康检查：<http://localhost:8000/health>
@@ -148,6 +181,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/rulesets/{id}/versions/{version}` | 获取指定版本快照 |
 | `PUT`  | `/api/rulesets/{id}` | 修改规则集 → 生成新版本并自动重算 |
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
+| `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
 | `POST` | `/api/rulesets/{id}/recompute` | 用旧文档对最新版重算（保留旧结果） |
@@ -168,6 +202,95 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate \
 # 3) 查询历史结果
 curl -s localhost:8000/api/rulesets/demo-promotions/evaluations | python3 -m json.tool
 ```
+
+### 批量评估
+
+`POST /api/rulesets/{id}/evaluate-batch` 一次提交多份文档：
+
+- 请求体 `documents` 为 JSON 数组，**单次最多 100 项**（超出返回 HTTP 422）；
+- 可选 `version`（请求体内）指定规则版本，缺省使用最新版；**整批固定使用
+  同一规则版本**，只解析编译一次；
+- 每项**独立求值**：某项求值失败只记录该项错误，**不中止整批**；
+- 响应按输入 `index` 逐项返回，并汇总 `success_count` / `error_count`；
+- 与单次评估一致，默认持久化各项成功结果；加 `?persist=false` 只算不存
+  （失败项不会落库）；
+- 规则集或指定版本不存在属于整批级错误，直接返回 HTTP 404。
+
+请求示例：
+
+```bash
+curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "documents": [
+      {"amount": 1500, "customer": {"vip": true}, "region": "north"},
+      {"amount": 80, "region": "north"},
+      {"amount": 10, "coupons": ["SAVE10", "SAVE20"]}
+    ]
+  }' | python3 -m json.tool
+```
+
+响应示例（每项结构与单次 `evaluate` 一致；此处 `result` 有省略）：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "version": 1,
+  "total": 3,
+  "success_count": 3,
+  "error_count": 0,
+  "results": [
+    {
+      "index": 0,
+      "status": "success",
+      "result": {
+        "id": "9f1c...",
+        "ruleset_id": "demo-promotions",
+        "version": 1,
+        "decision": {"discount": 0.15, "free_shipping": true},
+        "fired_rule_codes": ["is_vip", "large_order", "vip_discount", "free_shipping"],
+        "hit_rule_codes": ["vip_discount", "free_shipping"],
+        "converged": true,
+        "iterations": 2
+      },
+      "error": null
+    },
+    {
+      "index": 1,
+      "status": "success",
+      "result": {"decision": {}, "fired_rule_codes": [], "converged": true},
+      "error": null
+    },
+    {
+      "index": 2,
+      "status": "success",
+      "result": {"decision": {"coupon": "SAVE10"}, "fired_rule_codes": ["coupon_save10", "coupon_save20"]},
+      "error": null
+    }
+  ]
+}
+```
+
+某项求值失败时，该项 `status` 为 `error`、`result` 为 `null`，错误信息在
+`error` 中，其他项照常求值：
+
+```json
+{
+  "index": 2,
+  "status": "error",
+  "result": null,
+  "error": {
+    "code": "NOT_CONVERGED",
+    "message": "规则评估在 100 轮内未达到稳定状态",
+    "details": {"max_iterations": 100}
+  }
+}
+```
+
+> 注意：批量接口在存在失败项时仍返回 **HTTP 200**，通过每项的
+> `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
+> 整批级问题发生时才返回 4xx。
 
 ### 循环依赖被拒绝
 

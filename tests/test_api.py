@@ -269,3 +269,201 @@ def test_undeclared_reference_rejected(client):
     resp = client.post("/api/rulesets", json=payload)
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "UNDECLARED_REFERENCE"
+
+
+# ---------- 批量评估 ----------
+
+
+def test_evaluate_batch_basic(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    docs = [{"x": 42}, {"x": 1}, {"x": 100}]
+    resp = client.post(f"/api/rulesets/{rid}/evaluate-batch", json={"documents": docs})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ruleset_id"] == rid
+    assert body["version"] == 1
+    assert body["total"] == 3
+    assert body["success_count"] == 3
+    assert body["error_count"] == 0
+
+    # 结果严格按输入 index 排列
+    assert [item["index"] for item in body["results"]] == [0, 1, 2]
+    assert all(item["status"] == "success" for item in body["results"])
+    assert all(item["error"] is None for item in body["results"])
+    assert body["results"][0]["result"]["decision"] == {"level": "high", "bonus": 1}
+    assert body["results"][1]["result"]["decision"] == {}
+    assert body["results"][2]["result"]["decision"] == {"level": "high", "bonus": 1}
+
+    # 默认持久化：三项都应可在历史中查到
+    listing = client.get(f"/api/rulesets/{rid}/evaluations").json()
+    assert len(listing) == 3
+    saved_ids = {item["result"]["id"] for item in body["results"]}
+    assert all(saved_ids)  # id 非空
+    assert {e["id"] for e in listing} == saved_ids
+
+
+def test_evaluate_batch_empty_documents(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    resp = client.post(f"/api/rulesets/{rid}/evaluate-batch", json={"documents": []})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 0
+    assert body["success_count"] == 0
+    assert body["error_count"] == 0
+    assert body["results"] == []
+
+
+def test_evaluate_batch_rejects_more_than_100(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": i} for i in range(101)]},
+    )
+    assert resp.status_code == 422
+
+
+def test_evaluate_batch_accepts_exactly_100(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": i} for i in range(100)]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 100
+    assert body["success_count"] == 100
+    assert [item["index"] for item in body["results"]] == list(range(100))
+
+
+def test_evaluate_batch_item_error_does_not_abort(client, simple_ruleset_payload, monkeypatch):
+    from app.engine import EvaluationFailed
+    import app.main as main_module
+
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+
+    real_evaluate = main_module.evaluate
+
+    def flaky_evaluate(compiled, document):
+        if document.get("boom"):
+            raise EvaluationFailed(
+                "NOT_CONVERGED", "模拟不收敛", {"max_iterations": 100}
+            )
+        return real_evaluate(compiled, document)
+
+    monkeypatch.setattr(main_module, "evaluate", flaky_evaluate)
+
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": 42}, {"boom": True}, {"x": 100}]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success_count"] == 2
+    assert body["error_count"] == 1
+
+    ok0, bad1, ok2 = body["results"]
+    assert ok0["index"] == 0 and ok0["status"] == "success"
+    assert ok0["result"]["decision"] == {"level": "high", "bonus": 1}
+    assert bad1["index"] == 1 and bad1["status"] == "error"
+    assert bad1["result"] is None
+    assert bad1["error"]["code"] == "NOT_CONVERGED"
+    assert bad1["error"]["details"] == {"max_iterations": 100}
+    assert ok2["index"] == 2 and ok2["status"] == "success"
+    assert ok2["result"]["decision"] == {"level": "high", "bonus": 1}
+
+    # 失败项不落库，成功项照常落库
+    listing = client.get(f"/api/rulesets/{rid}/evaluations").json()
+    assert {e["id"] for e in listing} == {ok0["result"]["id"], ok2["result"]["id"]}
+
+
+def test_evaluate_batch_serialization_error_isolated(client, monkeypatch):
+    # 动作返回 set：引擎可求值，但落库 JSON 序列化失败，
+    # 该项记为 error 而不影响其他项
+    payload = {
+        "name": "set-action",
+        "rules": [{"code": "s", "condition": "true", "action": "{1, 2}"}],
+    }
+    rid = client.post("/api/rulesets", json=payload).json()["ruleset_id"]
+
+    import app.crud as crud_module
+
+    def broken_save(*args, **kwargs):
+        raise TypeError("Object of type set is not JSON serializable")
+
+    monkeypatch.setattr(crud_module, "save_evaluation", broken_save)
+
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": 1}, {"x": 2}]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success_count"] == 0
+    assert body["error_count"] == 2
+    for item in body["results"]:
+        assert item["status"] == "error"
+        assert item["error"]["code"] == "EVALUATION_ERROR"
+
+
+def test_evaluate_batch_uses_single_pinned_version(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    # 收紧为 v2：x=100 不再命中
+    client.put(
+        f"/api/rulesets/{rid}",
+        json={
+            "name": "simple",
+            "rules": [{"code": "r1", "condition": 'doc["x"] >= 1000'}],
+        },
+    )
+
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": 100}, {"x": 5000}], "version": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # 整批固定使用 v1
+    assert body["version"] == 1
+    assert all(item["result"]["version"] == 1 for item in body["results"])
+    # v1 阈值 10：x=100 命中 r1+r2
+    assert body["results"][0]["result"]["fired_rule_codes"] == ["r1", "r2"]
+    assert body["results"][1]["result"]["fired_rule_codes"] == ["r1", "r2"]
+
+    # 缺省 version 时整批使用最新版 v2
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": 100}, {"x": 5000}]},
+    )
+    body = resp.json()
+    assert body["version"] == 2
+    assert body["results"][0]["result"]["fired_rule_codes"] == []
+    assert body["results"][1]["result"]["fired_rule_codes"] == ["r1"]
+
+
+def test_evaluate_batch_missing_versions_and_ruleset(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch",
+        json={"documents": [{"x": 1}], "version": 99},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "VERSION_NOT_FOUND"
+
+    resp = client.post(
+        "/api/rulesets/nope/evaluate-batch", json={"documents": [{"x": 1}]}
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_evaluate_batch_persist_false(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    resp = client.post(
+        f"/api/rulesets/{rid}/evaluate-batch?persist=false",
+        json={"documents": [{"x": 42}, {"x": 1}]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success_count"] == 2
+    assert all(item["result"]["id"] == "" for item in body["results"])
+    assert client.get(f"/api/rulesets/{rid}/evaluations").json() == []

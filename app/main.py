@@ -20,7 +20,9 @@ from .engine import (
     evaluate,
 )
 from .schemas import (
+    BatchEvaluationOut,
     ErrorResponse,
+    EvaluateBatchRequest,
     EvaluateRequest,
     EvaluationOut,
     RecomputeRequest,
@@ -270,6 +272,27 @@ def get_version(
 # ---------- 决策计算 ----------
 
 
+def _persist_evaluation(
+    conn: sqlite3.Connection,
+    ruleset_id: str,
+    target_version: int,
+    document: Any,
+    result: dict[str, Any],
+    persist: bool,
+) -> dict[str, Any]:
+    """按 persist 决定是否落库；不落库时返回与落库同构的记录（id 为空）。"""
+    if persist:
+        return crud.save_evaluation(conn, ruleset_id, target_version, document, result)
+    return {
+        "id": "",
+        "ruleset_id": ruleset_id,
+        "version": target_version,
+        "document": document,
+        "created_at": crud.now(),
+        **result,
+    }
+
+
 @app.post(
     "/api/rulesets/{ruleset_id}/evaluate",
     response_model=EvaluationOut,
@@ -296,21 +319,91 @@ def evaluate_document(
         )
 
     result = evaluate(compiled, req.document)
+    return _persist_evaluation(
+        conn, ruleset_id, target_version, req.document, result, persist
+    )
 
-    if persist:
-        record = crud.save_evaluation(
-            conn, ruleset_id, target_version, req.document, result
-        )
-    else:
-        record = {
-            "id": "",
-            "ruleset_id": ruleset_id,
-            "version": target_version,
-            "document": req.document,
-            "created_at": crud.now(),
-            **result,
-        }
-    return record
+
+@app.post(
+    "/api/rulesets/{ruleset_id}/evaluate-batch",
+    response_model=BatchEvaluationOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}},
+)
+def evaluate_batch(
+    ruleset_id: str,
+    req: EvaluateBatchRequest,
+    persist: bool = Query(True, description="是否持久化各项成功的结果"),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """批量评估：整批固定使用同一规则版本，逐项独立求值。
+
+    版本/规则集级别的问题（不存在）返回 404；单项求值失败只记录在该项的
+    error 字段中，不中止整批。
+    """
+    row = crud.get_ruleset(conn, ruleset_id)
+    if row is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+
+    # 整批只解析、编译一次，所有项固定使用同一版本
+    target_version = req.version or row["current_version"]
+    try:
+        _snapshot, compiled = _load_compiled(conn, ruleset_id, target_version)
+    except LookupError:
+        return _error("VERSION_NOT_FOUND", f"版本 {target_version} 不存在", 404)
+
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    error_count = 0
+
+    for index, document in enumerate(req.documents):
+        try:
+            result = evaluate(compiled, document)
+            record = _persist_evaluation(
+                conn, ruleset_id, target_version, document, result, persist
+            )
+        except EvaluationFailed as exc:
+            error_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "result": None,
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "details": exc.details,
+                    },
+                }
+            )
+        except Exception as exc:  # 单项失败隔离，不中止整批
+            error_count += 1
+            results.append(
+                {
+                    "index": index,
+                    "status": "error",
+                    "result": None,
+                    "error": {
+                        "code": "EVALUATION_ERROR",
+                        "message": f"文档求值失败：{exc}",
+                        "details": {},
+                    },
+                }
+            )
+        else:
+            success_count += 1
+            results.append(
+                {"index": index, "status": "success", "result": record, "error": None}
+            )
+
+    return {
+        "ruleset_id": ruleset_id,
+        "version": target_version,
+        "total": len(req.documents),
+        "success_count": success_count,
+        "error_count": error_count,
+        "results": results,
+    }
 
 
 @app.post(
